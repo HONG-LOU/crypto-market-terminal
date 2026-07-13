@@ -31,11 +31,11 @@ struct Asset {
 constexpr std::array assets{
     Asset{"BTC", AssetKind::crypto}, Asset{"ETH", AssetKind::crypto},
     Asset{"SOL", AssetKind::crypto}, Asset{"BNB", AssetKind::crypto},
-    Asset{"XRP", AssetKind::crypto}, Asset{"DOGE", AssetKind::crypto},
+    Asset{"HYPE", AssetKind::crypto}, Asset{"ZEC", AssetKind::crypto},
+    Asset{"XAUT", AssetKind::crypto},
     Asset{"TSLA", AssetKind::stock_perpetual}, Asset{"NVDA", AssetKind::stock_perpetual},
-    Asset{"AAPL", AssetKind::stock_perpetual}, Asset{"AMZN", AssetKind::stock_perpetual},
-    Asset{"META", AssetKind::stock_perpetual}, Asset{"MSFT", AssetKind::stock_perpetual},
-    Asset{"COIN", AssetKind::stock_perpetual}, Asset{"MSTR", AssetKind::stock_perpetual},
+    Asset{"META", AssetKind::stock_perpetual}, Asset{"DRAM", AssetKind::stock_perpetual},
+    Asset{"SPCX", AssetKind::stock_perpetual}, Asset{"CRCL", AssetKind::stock_perpetual},
 };
 std::atomic_bool running{true};
 

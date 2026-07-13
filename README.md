@@ -5,8 +5,8 @@
 ## 特性
 
 - Binance 与 OKX 双数据源约 1 秒刷新，界面不暴露重复平台列
-- BTC、ETH、SOL、BNB、XRP、DOGE 现货行情
-- TSLA、NVDA、AAPL、AMZN、META、MSFT、COIN、MSTR 股票永续合约行情
+- BTC、ETH、SOL、BNB、HYPE、ZEC、XAUT 现货行情
+- TSLA、NVDA、META、DRAM、SPCX、CRCL 股票永续合约行情
 - 自动重试、请求超时和数据过期提示
 - 备用屏幕原位刷新，不污染终端历史、不产生滚屏
 - 多线程回调下的线程安全行情快照
