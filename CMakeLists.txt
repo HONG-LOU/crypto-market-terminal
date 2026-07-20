@@ -11,7 +11,12 @@ add_executable(crypto-market-terminal
   src/main.cpp
 )
 
-target_link_libraries(crypto-market-terminal PRIVATE winhttp)
+if(WIN32)
+  target_link_libraries(crypto-market-terminal PRIVATE winhttp)
+else()
+  find_package(CURL REQUIRED)
+  target_link_libraries(crypto-market-terminal PRIVATE CURL::libcurl)
+endif()
 
 if(MSVC)
   target_compile_options(crypto-market-terminal PRIVATE /W4 /permissive- /utf-8)

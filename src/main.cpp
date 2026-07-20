@@ -1,5 +1,9 @@
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
+#else
+#include <curl/curl.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -61,6 +65,7 @@ private:
   std::map<std::string, std::map<std::string, Quote>> quotes_;
 };
 
+#ifdef _WIN32
 struct InternetHandle {
   HINTERNET value{};
   ~InternetHandle() {
@@ -111,6 +116,36 @@ std::optional<std::string> get_https(std::wstring_view host, std::wstring_view p
   }
   return body;
 }
+#else
+size_t append_response(char* data, size_t size, size_t count, void* output) {
+  const auto bytes = size * count;
+  static_cast<std::string*>(output)->append(data, bytes);
+  return bytes;
+}
+
+std::optional<std::string> get_https(std::wstring_view host, std::wstring_view path) {
+  const std::string url =
+      "https://" + std::string{host.begin(), host.end()} + std::string{path.begin(), path.end()};
+  std::string body;
+  auto* curl = curl_easy_init();
+  if (!curl)
+    return std::nullopt;
+
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "CryptoMarketTerminal/1.0");
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3'000L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5'000L);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_response);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+  const auto result = curl_easy_perform(curl);
+  curl_easy_cleanup(curl);
+  if (result != CURLE_OK)
+    return std::nullopt;
+  return body;
+}
+#endif
 
 std::optional<std::string_view> json_string(std::string_view object, std::string_view key) {
   const auto marker = std::format("\"{}\":\"", key);
@@ -265,16 +300,24 @@ void render(const MarketStore& store, const std::array<ExchangePoller*, 2>& poll
 }
 
 void configure_terminal() {
+#ifdef _WIN32
   SetConsoleOutputCP(CP_UTF8);
   HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
   DWORD mode{};
   if (GetConsoleMode(output, &mode))
     SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
 }
 
 } // namespace
 
 int main() {
+#ifndef _WIN32
+  if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+    std::cerr << "Failed to initialize libcurl\n";
+    return 1;
+  }
+#endif
   configure_terminal();
   std::signal(SIGINT, [](int) { running.store(false); });
   std::signal(SIGTERM, [](int) { running.store(false); });
@@ -292,4 +335,7 @@ int main() {
   for (auto* poller : pollers)
     poller->stop();
   std::cout << "\x1b[?25h\x1b[?1049l\x1b[0m" << std::flush;
+#ifndef _WIN32
+  curl_global_cleanup();
+#endif
 }
