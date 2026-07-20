@@ -123,24 +123,37 @@ size_t append_response(char* data, size_t size, size_t count, void* output) {
   return bytes;
 }
 
+struct CurlHandle {
+  CURL* value{curl_easy_init()};
+  CurlHandle() = default;
+  ~CurlHandle() {
+    if (value)
+      curl_easy_cleanup(value);
+  }
+  CurlHandle(const CurlHandle&) = delete;
+  CurlHandle& operator=(const CurlHandle&) = delete;
+};
+
 std::optional<std::string> get_https(std::wstring_view host, std::wstring_view path) {
   const std::string url =
       "https://" + std::string{host.begin(), host.end()} + std::string{path.begin(), path.end()};
   std::string body;
-  auto* curl = curl_easy_init();
+  thread_local CurlHandle handle;
+  auto* curl = handle.value;
   if (!curl)
     return std::nullopt;
 
+  curl_easy_reset(curl);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "CryptoMarketTerminal/1.0");
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3'000L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5'000L);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_response);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
   const auto result = curl_easy_perform(curl);
-  curl_easy_cleanup(curl);
   if (result != CURLE_OK)
     return std::nullopt;
   return body;
