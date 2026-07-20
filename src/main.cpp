@@ -5,7 +5,6 @@
 #include <curl/curl.h>
 #endif
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -20,10 +19,14 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 using namespace std::chrono_literals;
 
 namespace {
+
+using HttpsRequest = std::pair<std::wstring, std::wstring>;
 
 enum class AssetKind { crypto, stock_perpetual };
 
@@ -116,6 +119,15 @@ std::optional<std::string> get_https(std::wstring_view host, std::wstring_view p
   }
   return body;
 }
+
+std::vector<std::optional<std::string>> get_https_batch(
+    const std::vector<HttpsRequest>& requests) {
+  std::vector<std::optional<std::string>> responses;
+  responses.reserve(requests.size());
+  for (const auto& [host, path] : requests)
+    responses.push_back(get_https(host, path));
+  return responses;
+}
 #else
 size_t append_response(char* data, size_t size, size_t count, void* output) {
   const auto bytes = size * count;
@@ -123,40 +135,89 @@ size_t append_response(char* data, size_t size, size_t count, void* output) {
   return bytes;
 }
 
-struct CurlHandle {
-  CURL* value{curl_easy_init()};
-  CurlHandle() = default;
-  ~CurlHandle() {
+struct CurlMultiHandle {
+  CURLM* value{curl_multi_init()};
+  CurlMultiHandle() = default;
+  ~CurlMultiHandle() {
     if (value)
-      curl_easy_cleanup(value);
+      curl_multi_cleanup(value);
   }
-  CurlHandle(const CurlHandle&) = delete;
-  CurlHandle& operator=(const CurlHandle&) = delete;
+  CurlMultiHandle(const CurlMultiHandle&) = delete;
+  CurlMultiHandle& operator=(const CurlMultiHandle&) = delete;
 };
 
-std::optional<std::string> get_https(std::wstring_view host, std::wstring_view path) {
-  const std::string url =
-      "https://" + std::string{host.begin(), host.end()} + std::string{path.begin(), path.end()};
+struct CurlTransfer {
+  size_t index{};
+  CURL* handle{};
+  std::string url;
   std::string body;
-  thread_local CurlHandle handle;
-  auto* curl = handle.value;
-  if (!curl)
-    return std::nullopt;
+  CURLcode result{CURLE_FAILED_INIT};
+};
 
-  curl_easy_reset(curl);
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, "CryptoMarketTerminal/1.0");
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3'000L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5'000L);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_response);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-  const auto result = curl_easy_perform(curl);
-  if (result != CURLE_OK)
-    return std::nullopt;
-  return body;
+std::vector<std::optional<std::string>> get_https_batch(
+    const std::vector<HttpsRequest>& requests) {
+  std::vector<std::optional<std::string>> responses(requests.size());
+  thread_local CurlMultiHandle multi;
+  if (!multi.value)
+    return responses;
+
+  std::vector<CurlTransfer> transfers;
+  transfers.reserve(requests.size());
+  for (size_t index = 0; index < requests.size(); ++index) {
+    const auto& [host, path] = requests[index];
+    transfers.push_back({index, curl_easy_init(),
+                         "https://" + std::string{host.begin(), host.end()} +
+                             std::string{path.begin(), path.end()},
+                         {}, CURLE_FAILED_INIT});
+    auto& transfer = transfers.back();
+    if (!transfer.handle)
+      continue;
+    curl_easy_setopt(transfer.handle, CURLOPT_URL, transfer.url.c_str());
+    curl_easy_setopt(transfer.handle, CURLOPT_USERAGENT, "CryptoMarketTerminal/1.0");
+    curl_easy_setopt(transfer.handle, CURLOPT_CONNECTTIMEOUT_MS, 3'000L);
+    curl_easy_setopt(transfer.handle, CURLOPT_TIMEOUT_MS, 5'000L);
+    curl_easy_setopt(transfer.handle, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(transfer.handle, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(transfer.handle, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, append_response);
+    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &transfer.body);
+    curl_easy_setopt(transfer.handle, CURLOPT_PRIVATE, &transfer);
+    if (curl_multi_add_handle(multi.value, transfer.handle) != CURLM_OK) {
+      curl_easy_cleanup(transfer.handle);
+      transfer.handle = nullptr;
+    }
+  }
+
+  int active{};
+  auto multi_result = curl_multi_perform(multi.value, &active);
+  while (multi_result == CURLM_OK && active > 0) {
+    int descriptors{};
+    multi_result = curl_multi_poll(multi.value, nullptr, 0, 1'000, &descriptors);
+    if (multi_result == CURLM_OK)
+      multi_result = curl_multi_perform(multi.value, &active);
+  }
+
+  int remaining{};
+  while (auto* message = curl_multi_info_read(multi.value, &remaining)) {
+    if (message->msg != CURLMSG_DONE)
+      continue;
+    CurlTransfer* transfer{};
+    curl_easy_getinfo(message->easy_handle, CURLINFO_PRIVATE, &transfer);
+    if (transfer)
+      transfer->result = message->data.result;
+  }
+
+  for (auto& transfer : transfers) {
+    if (!transfer.handle)
+      continue;
+    long status{};
+    curl_easy_getinfo(transfer.handle, CURLINFO_RESPONSE_CODE, &status);
+    if (transfer.result == CURLE_OK && status == 200)
+      responses[transfer.index] = std::move(transfer.body);
+    curl_multi_remove_handle(multi.value, transfer.handle);
+    curl_easy_cleanup(transfer.handle);
+  }
+  return responses;
 }
 #endif
 
@@ -184,7 +245,7 @@ std::optional<double> as_double(std::optional<std::string_view> value) {
 
 class ExchangePoller {
 public:
-  ExchangePoller(std::string name, MarketStore& store) : store_{store}, name_{std::move(name)} {}
+  explicit ExchangePoller(MarketStore& store) : store_{store} {}
   virtual ~ExchangePoller() { stop(); }
   void start() {
     worker_ = std::jthread([this](std::stop_token stop) { run(stop); });
@@ -195,76 +256,77 @@ public:
       worker_.join();
     }
   }
-  [[nodiscard]] bool healthy() const { return healthy_.load(); }
-  [[nodiscard]] const std::string& name() const { return name_; }
-
 protected:
-  virtual bool poll() = 0;
+  virtual void poll() = 0;
   MarketStore& store_;
 
 private:
   void run(std::stop_token stop) {
     while (!stop.stop_requested() && running.load()) {
-      healthy_.store(poll());
+      poll();
       for (int i = 0; i < 10 && !stop.stop_requested() && running.load(); ++i)
         std::this_thread::sleep_for(100ms);
     }
   }
-  std::string name_;
   std::jthread worker_;
-  std::atomic_bool healthy_{false};
 };
 
 class BinancePoller final : public ExchangePoller {
 public:
-  explicit BinancePoller(MarketStore& store) : ExchangePoller{"BINANCE", store} {}
+  explicit BinancePoller(MarketStore& store) : ExchangePoller{store} {}
 
 private:
-  bool poll() override {
-    bool updated = false;
+  void poll() override {
+    std::vector<HttpsRequest> requests;
+    requests.reserve(assets.size());
     for (const auto& asset : assets) {
       const std::wstring symbol{asset.symbol.begin(), asset.symbol.end()};
       const auto path = asset.kind == AssetKind::crypto
                             ? std::format(L"/api/v3/ticker/24hr?symbol={}USDT", symbol)
                             : std::format(L"/fapi/v1/ticker/24hr?symbol={}USDT", symbol);
       const auto host = asset.kind == AssetKind::crypto ? L"api.binance.com" : L"fapi.binance.com";
-      const auto body = get_https(host, path);
+      requests.emplace_back(host, path);
+    }
+    const auto responses = get_https_batch(requests);
+    for (size_t index = 0; index < assets.size(); ++index) {
+      const auto& asset = assets[index];
+      const auto& body = responses[index];
       if (!body)
         continue;
       const auto price = as_double(json_string(*body, "lastPrice"));
       const auto change = as_double(json_string(*body, "priceChangePercent"));
-      if (price && change) {
+      if (price && change)
         store_.update(std::string{asset.symbol}, "BINANCE", *price, *change);
-        updated = true;
-      }
     }
-    return updated;
   }
 };
 
 class OkxPoller final : public ExchangePoller {
 public:
-  explicit OkxPoller(MarketStore& store) : ExchangePoller{"OKX", store} {}
+  explicit OkxPoller(MarketStore& store) : ExchangePoller{store} {}
 
 private:
-  bool poll() override {
-    bool updated = false;
+  void poll() override {
+    std::vector<HttpsRequest> requests;
+    requests.reserve(assets.size());
     for (const auto& asset : assets) {
       const std::wstring symbol{asset.symbol.begin(), asset.symbol.end()};
       const auto path = asset.kind == AssetKind::crypto
                             ? std::format(L"/api/v5/market/ticker?instId={}-USDT", symbol)
                             : std::format(L"/api/v5/market/ticker?instId={}-USDT-SWAP", symbol);
-      const auto body = get_https(L"www.okx.com", path);
+      requests.emplace_back(L"www.okx.com", path);
+    }
+    const auto responses = get_https_batch(requests);
+    for (size_t index = 0; index < assets.size(); ++index) {
+      const auto& asset = assets[index];
+      const auto& body = responses[index];
       if (!body)
         continue;
       const auto price = as_double(json_string(*body, "last"));
       const auto open = as_double(json_string(*body, "open24h"));
-      if (price && open && *open != 0.0) {
+      if (price && open && *open != 0.0)
         store_.update(std::string{asset.symbol}, "OKX", *price, (*price / *open - 1.0) * 100.0);
-        updated = true;
-      }
     }
-    return updated;
   }
 };
 
@@ -275,7 +337,7 @@ std::string color_change(double value) {
 
 std::string price_string(double value) { return std::format("{:.2f}", value); }
 
-void render(const MarketStore& store, const std::array<ExchangePoller*, 2>& pollers) {
+void render(const MarketStore& store) {
   const auto data = store.snapshot();
   const auto now = std::chrono::steady_clock::now();
   std::ostringstream out;
@@ -283,6 +345,7 @@ void render(const MarketStore& store, const std::array<ExchangePoller*, 2>& poll
       << "  ─────────────────────────────────────────────────────\n"
       << "  ASSET     TYPE              PRICE        24H     STATUS\n"
       << "  ─────────────────────────────────────────────────────\n";
+  bool any_fresh = false;
   for (const auto& asset : assets) {
     const auto row = data.find(std::string{asset.symbol});
     std::optional<Quote> quote;
@@ -295,6 +358,7 @@ void render(const MarketStore& store, const std::array<ExchangePoller*, 2>& poll
           quote = it->second;
     }
     const bool stale = quote && now - quote->updated > 10s;
+    any_fresh = any_fresh || (quote && !stale);
     const auto type = asset.kind == AssetKind::crypto ? "CRYPTO" : "STOCK PERP";
     const auto price = quote ? price_string(quote->price) : "--";
     const auto change = quote ? color_change(quote->change24h) : std::string{"      --"};
@@ -305,9 +369,8 @@ void render(const MarketStore& store, const std::array<ExchangePoller*, 2>& poll
                        change, status);
   }
   out << "  ─────────────────────────────────────────────────────\n  DATA ";
-  const bool any_healthy =
-      std::ranges::any_of(pollers, [](const auto* poller) { return poller->healthy(); });
-  out << (any_healthy ? "\x1b[38;5;42m● ONLINE\x1b[0m" : "\x1b[38;5;203m● RECONNECTING\x1b[0m")
+  out << (any_fresh ? "\x1b[38;5;42m● ONLINE\x1b[0m"
+                    : "\x1b[38;5;203m● RECONNECTING\x1b[0m")
       << "   \x1b[38;5;244mCtrl+C to exit\x1b[0m";
   std::cout << out.str() << std::flush;
 }
@@ -342,7 +405,7 @@ int main() {
     poller->start();
   std::cout << "\x1b[?1049h\x1b[?25l\x1b[2J";
   while (running.load()) {
-    render(store, pollers);
+    render(store);
     std::this_thread::sleep_for(500ms);
   }
   for (auto* poller : pollers)
